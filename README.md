@@ -103,6 +103,46 @@ curl -X POST 'http://localhost:3000/v1/hcm/outbox/process?force=true'   # file p
 curl -X POST  http://localhost:3000/v1/hcm/sync                          # pull batch & reconcile now
 ```
 
+### On Windows (PowerShell)
+
+The `npm run …` commands above work the same in PowerShell. The `curl` examples, however, are
+written in bash style and need two tweaks in PowerShell:
+
+- Use **`curl.exe`** — in PowerShell, plain `curl` is an alias for `Invoke-WebRequest`, which does
+  **not** understand `-X` / `-H` / `-d`.
+- Keep each command on **one line** — PowerShell's line-continuation character is a backtick
+  `` ` ``, not the bash `\`.
+
+```powershell
+# Seed the HCM with 10 days for emp-1 @ loc-1
+curl.exe -X POST http://localhost:4000/admin/seed -H "content-type: application/json" -d '{"entries":[{"employeeId":"emp-1","locationId":"loc-1","balanceDays":10}]}'
+
+# Employee requests 3 days  -> 201, balance held (available 7)
+curl.exe -X POST http://localhost:3000/v1/time-off-requests -H "content-type: application/json" -d '{"employeeId":"emp-1","locationId":"loc-1","startDate":"2026-07-01","endDate":"2026-07-03"}'
+
+# Check the balance
+curl.exe http://localhost:3000/v1/balances/emp-1/loc-1
+
+# Manager approves (use the id returned by create)
+curl.exe -X POST http://localhost:3000/v1/time-off-requests/<ID>/approve -H "content-type: application/json" -d '{"approverId":"mgr-1"}'
+
+# Drive the outbox / reconcile immediately (note the quotes around the URL with ?query)
+curl.exe -X POST "http://localhost:3000/v1/hcm/outbox/process?force=true"
+curl.exe -X POST http://localhost:3000/v1/hcm/sync
+```
+
+Prefer native PowerShell? `Invoke-RestMethod` (alias `irm`) sends the request and prints parsed JSON:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:4000/admin/seed `
+  -ContentType 'application/json' `
+  -Body '{"entries":[{"employeeId":"emp-1","locationId":"loc-1","balanceDays":10}]}'
+
+Invoke-RestMethod http://localhost:3000/v1/balances/emp-1/loc-1
+```
+
+> Tip: the original bash commands run **as-is** in **Git Bash**, if you'd rather use that than PowerShell.
+
 ### Production-style run
 
 ```bash

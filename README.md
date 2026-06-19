@@ -6,8 +6,9 @@ truth.
 
 Built with **NestJS (TypeScript)** and **SQLite (TypeORM)**.
 
-> **Design & rationale:** see [**TRD.md**](./TRD.md) — the full Technical Requirements Document
-> (challenges, solution, architecture, alternatives, security, testing).
+> **Design & rationale:** see [**docs/TRD.pdf**](./docs/TRD.pdf) — the Technical Requirements Document
+> (challenges, solution, architecture, balance sync, database schema, testing), plus
+> [**docs/TEST-CASES.pdf**](./docs/TEST-CASES.pdf) for the testing overview.
 
 ---
 
@@ -166,5 +167,7 @@ test/
   mock-hcm/        runnable mock HCM server (real NestJS app simulating HCM behaviour)
   e2e/             end-to-end specs (full app vs real mock HCM)
   helpers/         test app + HTTP client + mock-HCM bootstrap
-TRD.md             Technical Requirements Document
+docs/
+  TRD.pdf          Technical Requirements Document (design & rationale)
+  TEST-CASES.pdf   Testing overview & proof of coverage
 ```

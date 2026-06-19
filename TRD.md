@@ -1,6 +1,6 @@
 # Technical Requirements Document — Time-Off Microservice
 
-**Status:** Implemented · **Author:** Engineering · **Stack:** NestJS (TypeScript) + SQLite (TypeORM)
+**Status:** Implemented · **Author:** Gustavo Gabry · **Stack:** NestJS (TypeScript) + SQLite (TypeORM)
 
 ---
 
@@ -65,34 +65,34 @@ integrity** against the HCM, while giving the Employee and Manager **instant, tr
 ## 3. High-level Architecture
 
 ```
-                 ┌──────────────────────────────────────────────────────────┐
-   Employee /    │                  Time-Off Microservice                    │
-   Manager UI    │                                                           │
-      │  REST     │   ┌────────────┐      ┌──────────────┐    ┌────────────┐  │
+                  ┌────────────────────────────────────────────────────────────┐
+   Employee /     │                  Time-Off Microservice                     │
+   Manager UI     │                                                            │
+      │  REST     │   ┌─────────────┐     ┌───────────────┐    ┌────────────┐  │
       └──────────►│   │ TimeOff     │     │ Balances      │    │ Ledger     │  │
                   │   │ Controller  ├────►│ Service       ├───►│ (append-   │  │
                   │   │ + Service   │     │ (hold/debit/  │    │  only)     │  │
                   │   └─────┬───────┘     │  credit/recon)│    └────────────┘  │
                   │         │ enqueue     └──────┬────────┘                    │
                   │         ▼                    │ reads/writes                │
-                  │   ┌────────────┐       ┌─────▼───────┐                     │
+                  │   ┌────────────┐       ┌─────▼────────┐                    │
                   │   │ HCM Outbox │◄──────┤  SQLite      │                    │
                   │   │ (table)    │       │  (TypeORM)   │                    │
                   │   └─────┬──────┘       └──────────────┘                    │
                   │         │ poll                                             │
-                  │   ┌─────▼────────┐   ┌──────────────────┐                  │
+                  │   ┌─────▼─────────┐   ┌──────────────────┐                 │
                   │   │ Outbox        │   │ Reconciliation   │                 │
                   │   │ Processor     │   │ Service          │                 │
                   │   └─────┬─────────┘   └─────┬────────────┘                 │
                   │         │   HcmClient (axios)│                             │
-                  └─────────┼────────────────────┼────────────────────────────┘
+                  └─────────┼────────────────────┼─────────────────────────────┘
                             │ realtime POST/GET  │ batch GET / webhook ingest
                             ▼                    ▼
-                  ┌─────────────────────────────────────────┐
+                  ┌──────────────────────────────────────────┐
                   │             HCM (source of truth)        │
                   │  /balances  /time-off  /batch/balances   │
                   │  (mock server simulates real behaviour)  │
-                  └─────────────────────────────────────────┘
+                  └──────────────────────────────────────────┘
 ```
 
 ### 3.1 Module map (acyclic by design)
@@ -278,6 +278,87 @@ we **do not silently mutate holds**. We record a `DISCREPANCY` ledger entry, log
 report `overcommitted` in the sync summary — a human/policy decides how to resolve (e.g. cancel the
 most recent pending request). Surfacing beats silently corrupting.
 
+### 6.5 Synchronization process — directions, triggers & cadence
+
+Sync is **bidirectional**, and each direction has its own trigger model. The same engine code backs
+both the scheduled jobs and the on-demand HTTP endpoints, so production runs automatically while
+tests drive identical logic deterministically (schedulers off via `DISABLE_SCHEDULERS=true`).
+
+```
+ OUTBOUND (we write to HCM)                 INBOUND (HCM balance → us)
+ ───────────────────────────               ─────────────────────────────────────────
+ outbox poll  ── every 2s ──► HCM           scheduled PULL  ── cron */5m ──► GET /batch/balances
+ on-demand    POST /outbox/process          PUSH (webhook)  ── HCM-initiated ──► POST /webhook/balances
+                                            event PULL (1 bucket) ── after a filing refusal
+```
+
+#### 6.5.1 Outbound cadence — how often we file with the HCM
+
+The outbox processor is the **only** writer to the HCM. It is driven on two clocks:
+
+| Knob | Env var | Default | Effect |
+|------|---------|---------|--------|
+| Poll interval | `OUTBOX_POLL_INTERVAL_MS` | **2000 ms** | how often `processBatch()` claims & delivers due items |
+| Batch size | `OUTBOX_BATCH_SIZE` | **25** | max items claimed per tick (oldest-first) |
+| Retry base | `OUTBOX_RETRY_BASE_MS` | **1000 ms** | back-off base for transient failures |
+| Max attempts | `HCM_MAX_RETRIES` | **5** | attempts before an item is `DEAD` (set on each item at enqueue) |
+| Per-call timeout | `HCM_TIMEOUT_MS` | **5000 ms** | timeout on each `POST /time-off` |
+
+- **Steady state:** every **2 seconds** the processor delivers up to **25** newly-due filings. A
+  freshly-approved request is therefore filed within ≤ ~2 s, without the approve call ever blocking
+  on the HCM.
+- **Transient failure back-off:** on a 5xx/timeout the item is rescheduled with
+  `delay = min(retryBase × 2^(attempts−1), 60_000ms)` → **1s, 2s, 4s, 8s** across attempts, then
+  `DEAD` on the 5th. `nextAttemptAt` gates re-delivery; the dispatch query is indexed on
+  `(status, nextAttemptAt)`.
+- **On demand:** `POST /v1/hcm/outbox/process` runs a tick immediately; `?force=true` ignores the
+  back-off schedule (used by ops and the e2e suite).
+- **Overlap guard:** ticks are non-reentrant (a `running` flag), so a slow tick never stacks.
+
+#### 6.5.2 Inbound — how the HCM balance reaches us
+
+Inbound has a **guaranteed floor cadence** plus two event-driven paths; all three converge into the
+same `ReconciliationService` engine (§6.4: staleness guard, timing-window adjustment, over-commit
+detection):
+
+1. **Scheduled pull (baseline) — every 5 minutes.** `RECONCILE_CRON` (default `*/5 * * * *`) calls
+   `pullAndReconcile()` → HCM **batch** corpus → reconcile every bucket. This is the safety net that
+   guarantees convergence to the HCM truth **even if no webhook ever arrives**. A failed pull (HCM
+   unreachable) logs a warning and simply retries next tick — it never crashes the scheduler.
+2. **Push (webhook) — event-driven, see §6.5.3.** Lower-latency convergence whenever the HCM chooses
+   to notify us.
+3. **Event pull (single bucket) — on a filing refusal.** When the HCM returns a *business* refusal
+   for a filing, that refusal proves our local view drifted, so the outbox processor immediately
+   calls `reconcileDimension()` (realtime `GET /balances` for that one bucket) to repair it.
+
+Cadence summary: **outbound ≈ every 2 s**, **inbound pull = every 5 min** (plus webhook pushes and
+post-refusal repairs as they occur). All values are env-overridable.
+
+#### 6.5.3 Inbound webhook (push) — `POST /v1/hcm/webhook/balances`
+
+The webhook lets the HCM **push** balance changes (e.g. an anniversary bonus, a yearly refresh, or
+*"+1 day for employeeId Y / locationId X"*) instead of waiting for the next 5-minute pull. Because it
+is **HCM-initiated, it has no fixed frequency** — it fires whenever the HCM has something to report;
+the scheduled pull (§6.5.2) remains the guaranteed floor if pushes are sparse or missed.
+
+- **Payload** (validated by `HcmWebhookDto`): an optional ISO-8601 `generatedAt` (the snapshot time;
+  defaults to *now* if omitted) and a `balances[]` array of `{ employeeId, locationId, leaveType?,
+  balanceDays }`. It accepts either a **single/few realtime** updates or a **full corpus** — same
+  shape, same handler.
+- **Shared engine:** it calls `reconciliation.ingest(snapshots, generatedAt)` — the **identical**
+  path as the batch pull, so the **staleness guard** (`asOf <= hcmAsOf` ⇒ ignored), the
+  **timing-window adjustment** (no false refund of post-snapshot confirmed debits), and **over-commit
+  detection** all apply to pushes exactly as to pulls. The HCM figure wins for `balanceDays`; local
+  `pendingDays` holds are preserved.
+- **Response:** the same `ReconcileSummary` (`applied / skipped / overcommitted / buckets`) as
+  `/sync`, making the push observable.
+
+**Scope boundary (honest):** we implement the webhook **receiver** only. There is **no subscription
+handshake** (we don't register a callback URL with the HCM) and **no push-signature verification**
+yet — the assessment's HCM contract defines neither. Signed/authenticated webhooks are listed as
+required-for-production in §13, and a subscription/registration step would be added when integrating
+a real HCM that supports it. In tests, an HCM push is simulated by POSTing to the endpoint directly.
+
 ---
 
 ## 7. Concurrency, Idempotency & Consistency
@@ -387,14 +468,14 @@ The value of an agentic build is in the rigor of its tests. We use two complemen
   ledger reconstruction, outbox retry→dead-letter, HCM error classification, the serialized
   transaction runner, and the scheduler wiring.
 - **End-to-end (`*.e2e-spec.ts`)** — the **full Nest app** over HTTP (supertest) against a **real,
-  running mock HCM server** (a separate Express app started on an ephemeral port). These cover the
+  running mock HCM server** (a separate NestJS app started on an ephemeral port). These cover the
   lifecycle, defensive validation, reconciliation scenarios (anniversary, yearly refresh, stale
   snapshot, timing window, over-commit, webhook), HCM failure modes (transient retry, dead-letter,
   business refusal), and concurrency/idempotency.
 
 ### 12.2 The mock HCM (a real server, not a stub)
 
-`test/mock-hcm/` is a runnable Express server (also `npm run mock:hcm`) that maintains its own
+`test/mock-hcm/` is a runnable NestJS server (also `npm run mock:hcm`) that maintains its own
 balances and simulates real behaviours: realtime get/file, batch corpus, **idempotent** filing,
 configurable **balance/dimension enforcement** (to test our defensiveness when the HCM is
 permissive), forced **transient/business** failures, and independent changes (**anniversary bonus**,

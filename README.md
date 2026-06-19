@@ -163,7 +163,7 @@ src/
   database/        TypeORM/SQLite wiring, entities, serialized transaction runner
   common/          enums, exceptions, validation, date/day utilities
 test/
-  mock-hcm/        runnable mock HCM server (real Express app simulating HCM behaviour)
+  mock-hcm/        runnable mock HCM server (real NestJS app simulating HCM behaviour)
   e2e/             end-to-end specs (full app vs real mock HCM)
   helpers/         test app + HTTP client + mock-HCM bootstrap
 TRD.md             Technical Requirements Document

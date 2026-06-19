@@ -11,17 +11,13 @@ export interface RunningMockHcm {
 
 /** Start the mock HCM on an ephemeral port for an e2e test and return its base URL + state. */
 export async function startMockHcm(): Promise<RunningMockHcm> {
-  const { app, state } = createMockHcm();
-  const server: Server = await new Promise((resolve) => {
-    const s = app.listen(0, () => resolve(s));
-  });
+  const { app, state } = await createMockHcm();
+  await app.listen(0);
+  const server = app.getHttpServer() as Server;
   const { port } = server.address() as AddressInfo;
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     state,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve())),
-      ),
+    close: () => app.close(),
   };
 }
